@@ -78,6 +78,8 @@ personality_permutations | `int` | `1` | Number of permutations of personality s
 device | `str` | `"cuda" if torch.cuda.is_available() else "cpu"` | Device (cuda or cpu)
 fp16 | `str` | `""` | Set to O0, O1, O2 or O3 for fp16 training (see apex documentation)
 local_rank | `int` | `-1` | Local rank for distributed training (-1: not distributed)
+output_path | `str` | `""` | Output log folder of the trained models and TensorBoard logs
+dist_backend | `str` | `None` | Distributed backends: "nccl", "gloo", "xla-tpu". (None, not distributed)
 
 Here is how to reproduce our results on a server with 8 V100 GPUs (adapt number of nodes and batch sizes to your configuration):
 

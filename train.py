@@ -9,13 +9,13 @@ from collections import defaultdict
 from itertools import chain
 
 import torch
-from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, TensorDataset
+import ignite.distributed as idist
 from ignite.engine import Engine, Events
-from ignite.handlers import ModelCheckpoint, global_step_from_engine
-from ignite.metrics import Accuracy, Loss, MetricsLambda, RunningAverage
+from ignite.handlers import ModelCheckpoint
+from ignite.metrics import Accuracy, Loss, RunningAverage
 from ignite.contrib.handlers import ProgressBar, PiecewiseLinear
-from ignite.contrib.handlers.tensorboard_logger import TensorboardLogger, OutputHandler, OptimizerParamsHandler
+from ignite.contrib.handlers.tensorboard_logger import TensorboardLogger
 from transformers import (AdamW, OpenAIGPTDoubleHeadsModel, OpenAIGPTTokenizer,
                                   GPT2DoubleHeadsModel, GPT2Tokenizer, WEIGHTS_NAME, CONFIG_NAME)
 
@@ -29,13 +29,13 @@ PADDED_INPUTS = ["input_ids", "lm_labels", "token_type_ids"]
 
 logger = logging.getLogger(__file__)
 
-def average_distributed_scalar(scalar, args):
-    """ Average a scalar over the nodes if we are in distributed training. We use this for distributed evaluation. """
-    if args.local_rank == -1:
-        return scalar
-    scalar_t = torch.tensor(scalar, dtype=torch.float, device=args.device) / torch.distributed.get_world_size()
-    torch.distributed.all_reduce(scalar_t, op=torch.distributed.ReduceOp.SUM)
-    return scalar_t.item()
+# def average_distributed_scalar(scalar, args):
+#     """ Average a scalar over the nodes if we are in distributed training. We use this for distributed evaluation. """
+#     if args.local_rank == -1:
+#         return scalar
+#     scalar_t = torch.tensor(scalar, dtype=torch.float, device=args.device) / torch.distributed.get_world_size()
+#     torch.distributed.all_reduce(scalar_t, op=torch.distributed.ReduceOp.SUM)
+#     return scalar_t.item()
 
 
 def pad_dataset(dataset, padding=0):
@@ -104,58 +104,33 @@ def get_data_loaders(args, tokenizer):
 
     logger.info("Build train and validation dataloaders")
     train_dataset, valid_dataset = TensorDataset(*tensor_datasets["train"]), TensorDataset(*tensor_datasets["valid"])
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset) if args.distributed else None
-    valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_dataset) if args.distributed else None
-    train_loader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, shuffle=(not args.distributed))
-    valid_loader = DataLoader(valid_dataset, sampler=valid_sampler, batch_size=args.valid_batch_size, shuffle=False)
+
+    # Create a dataloader adapted for non-distributed or distributed configuration
+    train_loader = idist.auto_dataloader(train_dataset, batch_size=args.train_batch_size, shuffle=True)
+    valid_loader = idist.auto_dataloader(valid_dataset, batch_size=args.valid_batch_size, shuffle=False)
 
     logger.info("Train dataset (Batch, Candidates, Seq length): {}".format(train_dataset.tensors[0].shape))
     logger.info("Valid dataset (Batch, Candidates, Seq length): {}".format(valid_dataset.tensors[0].shape))
-    return train_loader, valid_loader, train_sampler, valid_sampler
+    return train_loader, valid_loader, train_loader.sampler, valid_loader.sampler
 
 
-def train():
-    parser = ArgumentParser()
-    parser.add_argument("--dataset_path", type=str, default="", help="Path or url of the dataset. If empty download from S3.")
-    parser.add_argument("--dataset_cache", type=str, default='./dataset_cache', help="Path or url of the dataset cache")
-    parser.add_argument("--model_checkpoint", type=str, default="openai-gpt", help="Path, url or short name of the model")
-    parser.add_argument("--num_candidates", type=int, default=2, help="Number of candidates for training")
-    parser.add_argument("--max_history", type=int, default=2, help="Number of previous exchanges to keep in history")
-    parser.add_argument("--train_batch_size", type=int, default=4, help="Batch size for training")
-    parser.add_argument("--valid_batch_size", type=int, default=4, help="Batch size for validation")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Accumulate gradients on several steps")
-    parser.add_argument("--lr", type=float, default=6.25e-5, help="Learning rate")
-    parser.add_argument("--lm_coef", type=float, default=1.0, help="LM loss coefficient")
-    parser.add_argument("--mc_coef", type=float, default=1.0, help="Multiple-choice loss coefficient")
-    parser.add_argument("--max_norm", type=float, default=1.0, help="Clipping gradient norm")
-    parser.add_argument("--n_epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--personality_permutations", type=int, default=1, help="Number of permutations of personality sentences")
-    parser.add_argument("--eval_before_start", action='store_true', help="If true start with a first evaluation before training")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device (cuda or cpu)")
-    parser.add_argument("--fp16", type=str, default="", help="Set to O0, O1, O2 or O3 for fp16 training (see apex documentation)")
-    parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training (-1: not distributed)")
-    args = parser.parse_args()
+def train(local_rank, args):
 
     # logging is set to INFO (resp. WARN) for main (resp. auxiliary) process. logger.info => log main process only, logger.warning => log all processes
-    logging.basicConfig(level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
-    logger.warning("Running process %d", args.local_rank)  # This is a logger.warning: it will be printed by all distributed processes
+    logging.basicConfig(level=logging.INFO if local_rank in [-1, 0] else logging.WARN)
+    logger.warning("Running process %d", local_rank)  # This is a logger.warning: it will be printed by all distributed processes
     logger.info("Arguments: %s", pformat(args))
 
-    # Initialize distributed training if needed
-    args.distributed = (args.local_rank != -1)
-    if args.distributed:
-        torch.cuda.set_device(args.local_rank)
-        args.device = torch.device("cuda", args.local_rank)
-        torch.distributed.init_process_group(backend='nccl', init_method='env://')
+    device = idist.device()  # Get current device according to dist_backend: cuda or cuda:local_rank or xla:local_rank
 
     logger.info("Prepare tokenizer, pretrained model and optimizer.")
     tokenizer_class = GPT2Tokenizer if "gpt2" in args.model_checkpoint else OpenAIGPTTokenizer # cant use Autotokenizer because checkpoint could be a Path
     tokenizer = tokenizer_class.from_pretrained(args.model_checkpoint)
 
-
     model_class = GPT2DoubleHeadsModel if "gpt2" in args.model_checkpoint else OpenAIGPTDoubleHeadsModel
     model = model_class.from_pretrained(args.model_checkpoint)
-    model.to(args.device)
+    model.to(device)
+
     # Add special tokens if they are not already added
     add_special_tokens_(model, tokenizer)
     optimizer = AdamW(model.parameters(), lr=args.lr, correct_bias=True)
@@ -164,8 +139,8 @@ def train():
     if args.fp16:
         from apex import amp  # Apex is only required if we use fp16 training
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16)
-    if args.distributed:
-        model = DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank)
+
+    model = idist.auto_model(model)  # Adapt provided model for non-distributed or distributed configuration
 
     logger.info("Prepare datasets")
     train_loader, val_loader, train_sampler, valid_sampler = get_data_loaders(args, tokenizer)
@@ -210,11 +185,15 @@ def train():
     evaluator = Engine(inference)
 
     # Attach evaluation to trainer: we evaluate when we start the training and at the end of each epoch
-    trainer.add_event_handler(Events.EPOCH_COMPLETED, lambda _: evaluator.run(val_loader))
+    events = Events.EPOCH_COMPLETED
     if args.n_epochs < 1:
-        trainer.add_event_handler(Events.COMPLETED, lambda _: evaluator.run(val_loader))
+        events |= Events.COMPLETED
     if args.eval_before_start:
-        trainer.add_event_handler(Events.STARTED, lambda _: evaluator.run(val_loader))
+        events |= Events.STARTED
+
+    @trainer.on(events)
+    def run_evalutation():
+        evaluator.run(val_loader)
 
     # Make sure distributed data samplers split the dataset nicely between the distributed processes
     if args.distributed:
@@ -241,7 +220,7 @@ def train():
         pbar.attach(trainer, metric_names=["loss"])
         evaluator.add_event_handler(Events.COMPLETED, lambda _: pbar.log_message("Validation: %s" % pformat(evaluator.state.metrics)))
 
-        log_dir = make_logdir(args.model_checkpoint)
+        log_dir = make_logdir(args.model_checkpoint, output_path=args.output_path)
         tb_logger = TensorboardLogger(log_dir)
 
         tb_logger.attach(trainer, log_handler=OutputHandler(tag="training", metric_names=["loss"]), event_name=Events.ITERATION_COMPLETED)
@@ -264,4 +243,33 @@ def train():
         tb_logger.close()
 
 if __name__ == "__main__":
-    train()
+
+    parser = ArgumentParser()
+    parser.add_argument("--dataset_path", type=str, default="", help="Path or url of the dataset. If empty download from S3.")
+    parser.add_argument("--dataset_cache", type=str, default='./dataset_cache', help="Path or url of the dataset cache")
+    parser.add_argument("--model_checkpoint", type=str, default="openai-gpt", help="Path, url or short name of the model")
+    parser.add_argument("--num_candidates", type=int, default=2, help="Number of candidates for training")
+    parser.add_argument("--max_history", type=int, default=2, help="Number of previous exchanges to keep in history")
+    parser.add_argument("--train_batch_size", type=int, default=4, help="Batch size for training")
+    parser.add_argument("--valid_batch_size", type=int, default=4, help="Batch size for validation")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Accumulate gradients on several steps")
+    parser.add_argument("--lr", type=float, default=6.25e-5, help="Learning rate")
+    parser.add_argument("--lm_coef", type=float, default=1.0, help="LM loss coefficient")
+    parser.add_argument("--mc_coef", type=float, default=1.0, help="Multiple-choice loss coefficient")
+    parser.add_argument("--max_norm", type=float, default=1.0, help="Clipping gradient norm")
+    parser.add_argument("--n_epochs", type=int, default=3, help="Number of training epochs")
+    parser.add_argument("--personality_permutations", type=int, default=1, help="Number of permutations of personality sentences")
+    parser.add_argument("--eval_before_start", action='store_true', help="If true start with a first evaluation before training")
+    parser.add_argument("--fp16", type=str, default="", help="Set to O0, O1, O2 or O3 for fp16 training (see apex documentation)")
+    parser.add_argument("--output_path", type=str, default="", help="Output log folder of the trained models and TensorBoard logs")
+
+    possible_dist_backends = [None, "nccl", "gloo", "xla-tpu"]
+    parser.add_argument("--dist_backend", type=str, default=None, choice=possible_dist_backends, 
+                        help="Distributed backends. (None, not distributed)")
+    args = parser.parse_args()
+
+    if args.dist_backend == "xla-tpu" and len(args.fp16) > 0:
+        raise RuntimeError("Can not use NVidia/Apex with xla-tpu distributed backend")
+
+    with idist.Parallel(backend=args.dist_backend) as parallel:
+        parallel.run(train, args)
