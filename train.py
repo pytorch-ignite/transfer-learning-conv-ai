@@ -16,6 +16,7 @@ from ignite.handlers import ModelCheckpoint
 from ignite.metrics import Accuracy, Loss, RunningAverage
 from ignite.contrib.handlers import ProgressBar, PiecewiseLinear
 from ignite.contrib.handlers.tensorboard_logger import TensorboardLogger
+from ignite.contrib.engines import common
 from transformers import (AdamW, OpenAIGPTDoubleHeadsModel, OpenAIGPTTokenizer,
                                   GPT2DoubleHeadsModel, GPT2Tokenizer, WEIGHTS_NAME, CONFIG_NAME)
 
@@ -112,43 +113,14 @@ def get_data_loaders(args, tokenizer):
     logger.info("Train dataset (Batch, Candidates, Seq length): {}".format(train_dataset.tensors[0].shape))
     logger.info("Valid dataset (Batch, Candidates, Seq length): {}".format(valid_dataset.tensors[0].shape))
     return train_loader, valid_loader, train_loader.sampler, valid_loader.sampler
+    
+# Training function and trainer
 
-
-def train(local_rank, args):
-
-    # logging is set to INFO (resp. WARN) for main (resp. auxiliary) process. logger.info => log main process only, logger.warning => log all processes
-    logging.basicConfig(level=logging.INFO if local_rank in [-1, 0] else logging.WARN)
-    logger.warning("Running process %d", local_rank)  # This is a logger.warning: it will be printed by all distributed processes
-    logger.info("Arguments: %s", pformat(args))
-
-    device = idist.device()  # Get current device according to dist_backend: cuda or cuda:local_rank or xla:local_rank
-
-    logger.info("Prepare tokenizer, pretrained model and optimizer.")
-    tokenizer_class = GPT2Tokenizer if "gpt2" in args.model_checkpoint else OpenAIGPTTokenizer # cant use Autotokenizer because checkpoint could be a Path
-    tokenizer = tokenizer_class.from_pretrained(args.model_checkpoint)
-
-    model_class = GPT2DoubleHeadsModel if "gpt2" in args.model_checkpoint else OpenAIGPTDoubleHeadsModel
-    model = model_class.from_pretrained(args.model_checkpoint)
-    model.to(device)
-
-    # Add special tokens if they are not already added
-    add_special_tokens_(model, tokenizer)
-    optimizer = AdamW(model.parameters(), lr=args.lr, correct_bias=True)
-
-    # Prepare model for FP16 and distributed training if needed (order is important, distributed should be the last)
-    if args.fp16:
-        from apex import amp  # Apex is only required if we use fp16 training
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16)
-
-    model = idist.auto_model(model)  # Adapt provided model for non-distributed or distributed configuration
-
-    logger.info("Prepare datasets")
-    train_loader, val_loader, train_sampler, valid_sampler = get_data_loaders(args, tokenizer)
-
-    # Training function and trainer
+def create_trainer(model, optimizer, lr_scheduler, train_sampler, args, logger):
+    device = idist.device()
     def update(engine, batch):
         model.train()
-        batch = tuple(input_tensor.to(args.device) for input_tensor in batch)
+        batch = tuple(input_tensor.to(device) for input_tensor in batch)
         input_ids, mc_token_ids, lm_labels, mc_labels, token_type_ids = batch
         (lm_loss), (mc_loss), *_ = model(
             input_ids, token_type_ids=token_type_ids, mc_token_ids=mc_token_ids,
@@ -167,12 +139,30 @@ def train(local_rank, args):
             optimizer.zero_grad()
         return loss.item()
     trainer = Engine(update)
+    trainer.logger = logger
+    to_save = {"trainer": trainer, "model": model, "optimizer": optimizer, "lr_scheduler": lr_scheduler}
+    metric_names = [
+        "loss",
+    ]
+    common.setup_common_training_handlers(
+        trainer=trainer,
+        train_sampler=train_sampler,
+        to_save=to_save,
+        lr_scheduler=lr_scheduler,
+        output_names=metric_names,
+        with_pbars=True,
+        clear_cuda_cache=False,
+    )
+    return trainer
 
+
+def create_evaluator(model, tokenizer, metrics, tag="val"):
+    device = idist.device()
     # Evaluation function and evaluator (evaluator output is the input of the metrics)
     def inference(engine, batch):
         model.eval()
         with torch.no_grad():
-            batch = tuple(input_tensor.to(args.device) for input_tensor in batch)
+            batch = tuple(input_tensor.to(device) for input_tensor in batch)
             input_ids, mc_token_ids, lm_labels, mc_labels, token_type_ids = batch
             logger.info(tokenizer.decode(input_ids[0, -1, :].tolist()))
             # if we dont send labels to model, it doesnt return losses
@@ -183,6 +173,56 @@ def train(local_rank, args):
             lm_labels_flat_shifted = lm_labels[..., 1:].contiguous().view(-1)
             return (lm_logits_flat_shifted, mc_logits), (lm_labels_flat_shifted, mc_labels)
     evaluator = Engine(inference)
+    for name, metric in metrics.items():
+        metric.attach(evaluator, name)
+    return evaluator
+
+def train(local_rank, args):
+
+    # logging is set to INFO (resp. WARN) for main (resp. auxiliary) process. logger.info => log main process only, logger.warning => log all processes
+    logging.basicConfig(level=logging.INFO if local_rank in [-1, 0] else logging.WARN)
+    logger.warning("Running process %d", local_rank)  # This is a logger.warning: it will be printed by all distributed processes
+    logger.info("Arguments: %s", pformat(args))
+
+    device = idist.device()  # Get current device according to dist_backend: cuda or cuda:local_rank or xla:local_rank
+
+    logger.info("Prepare tokenizer, pretrained model and optimizer.")
+    tokenizer_class = GPT2Tokenizer if "gpt2" in args.model_checkpoint else OpenAIGPTTokenizer # cant use Autotokenizer because checkpoint could be a Path
+    tokenizer = tokenizer_class.from_pretrained(args.model_checkpoint)
+
+    model_class = GPT2DoubleHeadsModel if "gpt2" in args.model_checkpoint else OpenAIGPTDoubleHeadsModel
+    model = model_class.from_pretrained(args.model_checkpoint)
+    # Add special tokens if they are not already added
+    add_special_tokens_(model, tokenizer)
+
+    optimizer = AdamW(model.parameters(), lr=args.lr, correct_bias=True)
+
+    # Prepare metrics - note how we compute distributed metrics
+    metrics = {
+        "Accuracy": Accuracy(output_transform=lambda x: (x[0][1], x[1][1])),
+        "nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100), output_transform=lambda x: (x[0][0], x[1][0])),
+    }
+    metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics["nll"], args),
+                    "average_accuracy": MetricsLambda(average_distributed_scalar, metrics["accuracy"], args)})
+    metrics["average_ppl"] = MetricsLambda(math.exp, metrics["average_nll"])
+
+        
+    # Prepare model for FP16 and distributed training if needed (order is important, distributed should be the last)
+    if args.fp16:
+        from apex import amp  # Apex is only required if we use fp16 training
+        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16)
+
+    model = idist.auto_model(model)  # Adapt provided model for non-distributed or distributed configuration
+
+    logger.info("Prepare datasets")
+    train_loader, val_loader, train_sampler, valid_sampler = get_data_loaders(args, tokenizer)
+    # Linearly decrease the learning rate from lr to zero
+    scheduler = PiecewiseLinear(optimizer, "lr", [(0, args.lr), (args.n_epochs * len(train_loader), 0.0)])
+
+    trainer = create_trainer(model,optimizer,scheduler,train_sampler,args)
+    evaluator = create_evaluator(model,tokenizer,metrics)
+    
+
 
     # Attach evaluation to trainer: we evaluate when we start the training and at the end of each epoch
     events = Events.EPOCH_COMPLETED
@@ -200,19 +240,6 @@ def train(local_rank, args):
         trainer.add_event_handler(Events.EPOCH_STARTED, lambda engine: train_sampler.set_epoch(engine.state.epoch))
         evaluator.add_event_handler(Events.EPOCH_STARTED, lambda engine: valid_sampler.set_epoch(engine.state.epoch))
 
-    # Linearly decrease the learning rate from lr to zero
-    scheduler = PiecewiseLinear(optimizer, "lr", [(0, args.lr), (args.n_epochs * len(train_loader), 0.0)])
-    trainer.add_event_handler(Events.ITERATION_STARTED, scheduler)
-
-    # Prepare metrics - note how we compute distributed metrics
-    RunningAverage(output_transform=lambda x: x).attach(trainer, "loss")
-    metrics = {"nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100), output_transform=lambda x: (x[0][0], x[1][0])),
-               "accuracy": Accuracy(output_transform=lambda x: (x[0][1], x[1][1]))}
-    metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics["nll"], args),
-                    "average_accuracy": MetricsLambda(average_distributed_scalar, metrics["accuracy"], args)})
-    metrics["average_ppl"] = MetricsLambda(math.exp, metrics["average_nll"])
-    for name, metric in metrics.items():
-        metric.attach(evaluator, name)
 
     # On the main process: add progress bar, tensorboard, checkpoints and save model, configuration and tokenizer before we start to train
     if args.local_rank in [-1, 0]:
