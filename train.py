@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import TensorDataset
 import ignite.distributed as idist
 from ignite.engine import Engine, Events
-from ignite.handlers import ModelCheckpoint
+from ignite.handlers import ModelCheckpoint , DiskSaver
 from ignite.metrics import Accuracy, Loss, RunningAverage,MetricsLambda
 from ignite.contrib.handlers import ProgressBar, PiecewiseLinear
 from ignite.contrib.handlers.tensorboard_logger import  OptimizerParamsHandler
@@ -139,9 +139,11 @@ def create_trainer(model, optimizer, lr_scheduler, train_sampler, args):
     common.setup_common_training_handlers(
         trainer=trainer,
         train_sampler=train_sampler,
+        save_handler=DiskSaver(args.output_path, require_empty=False),
         to_save=to_save,
         lr_scheduler=lr_scheduler,
         output_names=metric_names,
+        with_pbars=True,
         clear_cuda_cache=False,
     )
     return trainer
@@ -169,6 +171,8 @@ def create_evaluator(model, tokenizer, metrics, tag="val"):
         metric.attach(evaluator, name)
     if idist.get_rank() == 0:
         common.ProgressBar(desc=f"Evaluation ({tag})", persist=False).attach(evaluator)
+        evaluator.add_event_handler(Events.COMPLETED, lambda _: pbar.log_message("Validation: %s" % pformat(evaluator.state.metrics)))
+
     return evaluator
 
 def train(local_rank, args):
@@ -206,7 +210,7 @@ def train(local_rank, args):
     model = idist.auto_model(model)  # Adapt provided model for non-distributed or distributed configuration
 
     logger.info("Prepare datasets")
-    train_loader, val_loader, train_sampler, valid_sampler = get_data_loaders(args, tokenizer, local_rank)
+    train_loader, val_loader, train_sampler, valid_sampler = get_data_loaders(args, tokenizer)
     # Linearly decrease the learning rate from lr to zero
     scheduler = PiecewiseLinear(optimizer, "lr", [(0, args.lr), (args.n_epochs * len(train_loader), 0.0)])
 
@@ -227,17 +231,13 @@ def train(local_rank, args):
         evaluator.run(val_loader)
 
     # Make sure distributed data samplers split the dataset nicely between the distributed processes
-    if args.dist_backend:
-        trainer.add_event_handler(Events.EPOCH_STARTED, lambda engine: train_sampler.set_epoch(engine.state.epoch))
-        evaluator.add_event_handler(Events.EPOCH_STARTED, lambda engine: valid_sampler.set_epoch(engine.state.epoch))
+    #if args.dist_backend:
+        #trainer.add_event_handler(Events.EPOCH_STARTED, lambda engine: train_sampler.set_epoch(engine.state.epoch))
+        #evaluator.add_event_handler(Events.EPOCH_STARTED, lambda engine: valid_sampler.set_epoch(engine.state.epoch))
 
 
     # On the main process: add progress bar, tensorboard, checkpoints and save model, configuration and tokenizer before we start to train
     if rank  == 0:
-        pbar = ProgressBar(persist=True)
-        pbar.attach(trainer, metric_names=["loss"])
-        evaluator.add_event_handler(Events.COMPLETED, lambda _: pbar.log_message("Validation: %s" % pformat(evaluator.state.metrics)))
-
         log_dir = make_logdir(args.model_checkpoint, output_path=args.output_path)
         tb_logger = common.setup_tb_logging(
             args.output_path, trainer, evaluators=evaluator
@@ -280,7 +280,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_path", type=str, default="", help="Output log folder of the trained models and TensorBoard logs")
 
     possible_dist_backends = [None, "nccl", "gloo", "xla-tpu"]
-    parser.add_argument("--dist_backend", type=str, default=None, choice=possible_dist_backends, 
+    parser.add_argument("--dist_backend", type=str, default=None, choices=possible_dist_backends, 
                         help="Distributed backends. (None, not distributed)")
     args = parser.parse_args()
 
