@@ -71,4 +71,5 @@ def make_logdir(model_name: str, output_path: str = ""):
     current_time = datetime.now().strftime('%b%d_%H-%M-%S')
     logdir = os.path.join(output_path,
         'runs', current_time + '_' + socket.gethostname() + '_' + model_name)
+    os.makedirs(logdir)
     return logdir

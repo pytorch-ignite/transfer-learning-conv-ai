@@ -12,10 +12,9 @@ import torch
 from torch.utils.data import TensorDataset
 import ignite.distributed as idist
 from ignite.engine import Engine, Events
-from ignite.handlers import ModelCheckpoint , DiskSaver
-from ignite.metrics import Accuracy, Loss, RunningAverage,MetricsLambda
+from ignite.handlers import DiskSaver
+from ignite.metrics import Accuracy, Loss, MetricsLambda
 from ignite.contrib.handlers import ProgressBar, PiecewiseLinear
-from ignite.contrib.handlers.tensorboard_logger import  OptimizerParamsHandler
 from ignite.contrib.engines import common
 from transformers import (AdamW, OpenAIGPTDoubleHeadsModel, OpenAIGPTTokenizer,
                                   GPT2DoubleHeadsModel, GPT2Tokenizer, WEIGHTS_NAME, CONFIG_NAME)
@@ -141,10 +140,12 @@ def create_trainer(model, optimizer, lr_scheduler, train_sampler, args):
         train_sampler=train_sampler,
         save_handler=DiskSaver(args.output_path, require_empty=False),
         to_save=to_save,
+        log_every_iters=10,
         lr_scheduler=lr_scheduler,
         output_names=metric_names,
         with_pbars=True,
         clear_cuda_cache=False,
+        n_saved=3,
     )
     return trainer
 
@@ -157,7 +158,7 @@ def create_evaluator(model, tokenizer, metrics, tag="val"):
         with torch.no_grad():
             batch = tuple(input_tensor.to(device) for input_tensor in batch)
             input_ids, mc_token_ids, lm_labels, mc_labels, token_type_ids = batch
-            logger.info(tokenizer.decode(input_ids[0, -1, :].tolist()))
+            #logger.info(tokenizer.decode(input_ids[0, -1, :].tolist()))
             # if we dont send labels to model, it doesnt return losses
             lm_logits, mc_logits, *_ = model(
                 input_ids, token_type_ids=token_type_ids, mc_token_ids=mc_token_ids,
@@ -170,8 +171,9 @@ def create_evaluator(model, tokenizer, metrics, tag="val"):
     for name, metric in metrics.items():
         metric.attach(evaluator, name)
     if idist.get_rank() == 0:
-        common.ProgressBar(desc=f"Evaluation ({tag})", persist=False).attach(evaluator)
-        evaluator.add_event_handler(Events.COMPLETED, lambda _: pbar.log_message("Validation: %s" % pformat(evaluator.state.metrics)))
+        pbar = common.ProgressBar(desc=f"Evaluation ({tag})", persist=False)
+        pbar.attach(evaluator)
+        evaluator.add_event_handler(Events.COMPLETED,lambda _: pbar.log_message("Validation: %s" % pformat(evaluator.state.metrics)))
 
     return evaluator
 
@@ -193,15 +195,12 @@ def train(local_rank, args):
 
     optimizer = AdamW(model.parameters(), lr=args.lr, correct_bias=True)
 
-    # Prepare metrics - note how we compute distributed metrics
     metrics = {
         "Accuracy": Accuracy(output_transform=lambda x: (x[0][1], x[1][1])),
         "nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-100), output_transform=lambda x: (x[0][0], x[1][0])),
     }
-    metrics.update({"average_nll": RunningAverage(metrics["nll"]),
-                    "average_accuracy":RunningAverage(metrics["Accuracy"])})
-    metrics["average_ppl"] = MetricsLambda(math.exp, metrics["average_nll"])
-
+    metrics["ppl"] = MetricsLambda(math.exp, metrics["nll"])
+    
     # Prepare model for FP16 and distributed training if needed (order is important, distributed should be the last)
     if args.fp16:
         from apex import amp  # Apex is only required if we use fp16 training
@@ -211,51 +210,34 @@ def train(local_rank, args):
 
     logger.info("Prepare datasets")
     train_loader, val_loader, train_sampler, valid_sampler = get_data_loaders(args, tokenizer)
+
+
     # Linearly decrease the learning rate from lr to zero
     scheduler = PiecewiseLinear(optimizer, "lr", [(0, args.lr), (args.n_epochs * len(train_loader), 0.0)])
 
     trainer = create_trainer(model,optimizer,scheduler,train_sampler,args)
     evaluator = create_evaluator(model,tokenizer,metrics)
     
-
-
-    # Attach evaluation to trainer: we evaluate when we start the training and at the end of each epoch
-    events = Events.EPOCH_COMPLETED
-    if args.n_epochs < 1:
-        events |= Events.COMPLETED
-    if args.eval_before_start:
-        events |= Events.STARTED
-
-    @trainer.on(events)
     def run_evaluation():
         evaluator.run(val_loader)
 
-    # Make sure distributed data samplers split the dataset nicely between the distributed processes
-    #if args.dist_backend:
-        #trainer.add_event_handler(Events.EPOCH_STARTED, lambda engine: train_sampler.set_epoch(engine.state.epoch))
-        #evaluator.add_event_handler(Events.EPOCH_STARTED, lambda engine: valid_sampler.set_epoch(engine.state.epoch))
+    # Attach evaluation to trainer: we evaluate when we start the training and at the end of each epoch
 
+    trainer.add_event_handler(Events.EPOCH_COMPLETED | Events.STARTED, run_evaluation)
 
-    # On the main process: add progress bar, tensorboard, checkpoints and save model, configuration and tokenizer before we start to train
+    # On the main process: add progress bar, tensorboard,  and save model, configuration and tokenizer before we start to train
     if rank  == 0:
         log_dir = make_logdir(args.model_checkpoint, output_path=args.output_path)
-        tb_logger = common.setup_tb_logging(
-            args.output_path, trainer, evaluators=evaluator
-        )
-        tb_logger.attach(trainer, log_handler=OptimizerParamsHandler(optimizer), event_name=Events.ITERATION_STARTED)
-        checkpoint_handler = ModelCheckpoint(log_dir, 'checkpoint', save_interval=1, n_saved=3)
-        trainer.add_event_handler(Events.EPOCH_COMPLETED, checkpoint_handler, {'mymodel': getattr(model, 'module', model)})  # "getattr" takes care of distributed encapsulation
-
-        torch.save(args, log_dir + '/model_training_args.bin')
-        getattr(model, 'module', model).config.to_json_file(os.path.join(log_dir, CONFIG_NAME))
+        tb_logger = common.setup_tb_logging(args.output_path, trainer, evaluators=evaluator)
+        torch.save(args, log_dir + "/model_training_args.bin")
+        getattr(model, "module", model).config.to_json_file(os.path.join(log_dir, CONFIG_NAME))
         tokenizer.save_pretrained(log_dir)
 
     # Run the training
     trainer.run(train_loader, max_epochs=args.n_epochs)
 
-    # On the main process: close tensorboard logger and rename the last checkpoint (for easy re-loading with OpenAIGPTModel.from_pretrained method)
-    if rank == 0 and args.n_epochs > 0:
-        os.rename(os.path.join(log_dir, checkpoint_handler._saved[-1][1]), os.path.join(log_dir, WEIGHTS_NAME))  # TODO: PR in ignite to have better access to saved file paths (cleaner)
+    # On the main process: close tensorboard logger
+    if rank == 0:
         tb_logger.close()
 
 if __name__ == "__main__":
@@ -278,6 +260,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval_before_start", action='store_true', help="If true start with a first evaluation before training")
     parser.add_argument("--fp16", type=str, default="", help="Set to O0, O1, O2 or O3 for fp16 training (see apex documentation)")
     parser.add_argument("--output_path", type=str, default="", help="Output log folder of the trained models and TensorBoard logs")
+    parser.add_argument("--nproc_per_node", type=int, default=None, help="optional argument to setup number of processes per node")
 
     possible_dist_backends = [None, "nccl", "gloo", "xla-tpu"]
     parser.add_argument("--dist_backend", type=str, default=None, choices=possible_dist_backends, 
@@ -287,5 +270,5 @@ if __name__ == "__main__":
     if args.dist_backend == "xla-tpu" and len(args.fp16) > 0:
         raise RuntimeError("Can not use NVidia/Apex with xla-tpu distributed backend")
 
-    with idist.Parallel(backend=args.dist_backend) as parallel:
+    with idist.Parallel(backend=args.dist_backend,nproc_per_node=args.nproc_per_node) as parallel:
         parallel.run(train, args)
